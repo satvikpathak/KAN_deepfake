@@ -42,3 +42,45 @@ matplotlib, seaborn, torch, torchvision, pykan, tqdm, scipy
 - KAN achieves competitive AUC with significantly fewer parameters than CNNs
 - Learned B-spline activations provide interpretable frequency-domain features
 - Detection is robust to JPEG compression and generalises to unseen generators
+
+## Colab-Safe Full-Dataset Training (32GB+) 
+
+If the notebooks crash after Stage 2 due to RAM limits, use the streaming pipeline in
+`streaming_colab_pipeline.py`. It avoids loading all phase maps into memory.
+
+### Why this works
+
+- **Disk-backed shards**: phase maps are written to `phase_shards/x_*.npy` + `y_*.npy`
+- **Memory mapping**: training reads shards with `mmap_mode='r'`
+- **Bounded DataLoader memory**: small worker count and conservative prefetching
+- **AMP + grad accumulation**: stable 100-epoch training with lower VRAM usage
+
+### Run on Colab
+
+1. Mount Drive and point `--cache-dir` / `--model-dir` to Drive paths.
+2. Install deps from `requirements.txt`.
+3. Run extract once, then train (or run `all`).
+
+```bash
+python streaming_colab_pipeline.py extract \
+	--input-dir /content/dataset \
+	--cache-dir /content/drive/MyDrive/kan_cache \
+	--shard-size 2048 \
+	--image-size 256 \
+	--dtype float16
+
+python streaming_colab_pipeline.py train \
+	--shard-dir /content/drive/MyDrive/kan_cache/phase_shards \
+	--model-dir /content/drive/MyDrive/kan_models \
+	--epochs 100 \
+	--batch-size 32 \
+	--grad-accum-steps 2 \
+	--num-workers 2
+```
+
+### Notes
+
+- `--epochs 100` is supported out-of-the-box.
+- If Colab still runs out of memory, reduce `--batch-size` first, then `--shard-size`.
+- Accuracy depends on data quality/splits/model settings; this pipeline guarantees memory safety,
+	not a fixed accuracy threshold.
