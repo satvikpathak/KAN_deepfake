@@ -65,8 +65,9 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms as T
 from PIL import Image
 import matplotlib
-matplotlib.use("Agg")             # headless backend for Colab
 import matplotlib.pyplot as plt
+# NOTE: We do NOT call matplotlib.use("Agg") so that plt.show() renders
+# inline inside Colab / Jupyter notebooks.
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, roc_curve, confusion_matrix,
@@ -163,21 +164,36 @@ print("Dataset manifest built ✅")
 
 
 # %% ═══════════════════════════════════════════════════════════════════════════
-# CELL 3 — Phase-Spectrum Dataset (Lazy-Loading, No Resize)
+# CELL 3 — Spatial Dataset + GPU Phase-Spectrum Extractor
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CROP_SIZE = 224   # CenterCrop — NO Resize / interpolation
+print("\n🔧 Initialising Spatial Dataset + GPU Phase Extractor ...")
+print("   → Dataset returns RAW grayscale spatial tensors (no FFT on CPU)")
+print("   → FFT is computed ON THE GPU in batch via extract_phase_spectrum_gpu()")
+print("   → This fixes the 2 it/s CPU bottleneck from per-sample FFT")
+print("   → Training uses RandomCrop + RandomHorizontalFlip (dynamic augmentation)")
+print("   → Validation/Test uses static CenterCrop (deterministic evaluation)\n")
+
+CROP_SIZE = 224   # Crop size — NO Resize / interpolation
 
 
 class PhaseSpectrumDataset(Dataset):
     """
-    Lazy-loading dataset that:
+    Lazy-loading dataset — returns RAW SPATIAL tensors (NOT phase spectrums).
+
+    Pipeline:
       1) Reads an image from disk (PIL)
       2) Converts to grayscale
-      3) Centre-crops to (CROP_SIZE × CROP_SIZE)
-      4) Computes the 2-D FFT, shifts zero-freq to centre, extracts phase
-      5) Normalises phase to [0, 1]
-      6) Returns (phase_tensor, label)
+      3) Crops to (CROP_SIZE × CROP_SIZE):
+         - Training:  RandomCrop + RandomHorizontalFlip  (dynamic per epoch)
+         - Eval/Test: CenterCrop                         (deterministic)
+      4) Converts to tensor via T.ToTensor()
+      5) Returns (spatial_tensor, label)   ← NO FFT here!
+
+    The 2-D FFT is computed on the GPU in batches by
+    extract_phase_spectrum_gpu() inside the training loop.
+    This avoids the severe CPU bottleneck from computing per-sample
+    FFT inside __getitem__.
 
     IMPORTANT: No Resize transform — resizing destroys the high-frequency
     artifacts that distinguish AI-generated images.
@@ -187,33 +203,28 @@ class PhaseSpectrumDataset(Dataset):
         self,
         samples: List[Tuple[str, int]],
         crop_size: int = CROP_SIZE,
+        is_train: bool = False,
     ):
         super().__init__()
         self.samples = samples
         self.crop_size = crop_size
-        # Deterministic spatial transform — crop only, no resize
-        self.spatial_tf = T.Compose([
-            T.CenterCrop(crop_size),
-        ])
+        self.is_train = is_train
+
+        # Dynamic augs for training, static crop for validation/test
+        if is_train:
+            self.spatial_tf = T.Compose([
+                T.RandomCrop(crop_size),
+                T.RandomHorizontalFlip(p=0.5),
+            ])
+            print("   ✦ Training mode  → RandomCrop + RandomHorizontalFlip")
+        else:
+            self.spatial_tf = T.Compose([
+                T.CenterCrop(crop_size),
+            ])
+            print("   ✦ Eval mode      → CenterCrop (deterministic)")
 
     def __len__(self) -> int:
         return len(self.samples)
-
-    @staticmethod
-    def _extract_phase(gray_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Compute 2-D FFT → shift → extract phase spectrum.
-        Input : (1, H, W) float32 tensor
-        Output: (1, H, W) float32 tensor, normalised to [0, 1]
-        """
-        # Remove channel dim for fft2
-        x = gray_tensor.squeeze(0)                      # (H, W)
-        fft2 = torch.fft.fft2(x)                        # complex
-        fft2_shifted = torch.fft.fftshift(fft2)          # shift DC to centre
-        phase = torch.angle(fft2_shifted)                # ∈ [-π, π]
-        # Normalise to [0, 1]
-        phase = (phase + torch.pi) / (2 * torch.pi)
-        return phase.unsqueeze(0)                        # (1, H, W)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         path, label = self.samples[idx]
@@ -223,29 +234,68 @@ class PhaseSpectrumDataset(Dataset):
             # Fallback: return a black image if file is corrupted
             img = Image.new("L", (self.crop_size, self.crop_size), 0)
 
-        # Ensure image is large enough for CenterCrop
+        # Ensure image is large enough for crop
         w, h = img.size
         if w < self.crop_size or h < self.crop_size:
-            # Pad to minimum size WITHOUT interpolation/resizing
             new_w = max(w, self.crop_size)
             new_h = max(h, self.crop_size)
             padded = Image.new("L", (new_w, new_h), 0)
             padded.paste(img, ((new_w - w) // 2, (new_h - h) // 2))
             img = padded
 
-        img = self.spatial_tf(img)                       # CenterCrop
+        img = self.spatial_tf(img)                       # RandomCrop or CenterCrop
         tensor = T.ToTensor()(img)                       # (1, H, W), [0,1]
-        phase = self._extract_phase(tensor)              # (1, H, W), [0,1]
-        return phase, torch.tensor(label, dtype=torch.float32)
+        return tensor, torch.tensor(label, dtype=torch.float32)
 
+
+# ── GPU Phase-Spectrum Extractor (batch-vectorised) ─────────────────────────
+
+def extract_phase_spectrum_gpu(batch: torch.Tensor) -> torch.Tensor:
+    """
+    Compute 2-D FFT → shift → phase spectrum FOR AN ENTIRE BATCH on the GPU.
+
+    This replaces the old per-sample CPU _extract_phase() and is the key
+    performance fix: a single vectorised CUDA call instead of N sequential
+    CPU FFTs inside the DataLoader workers.
+
+    Args:
+        batch: (B, 1, H, W) float32 tensor on CUDA
+    Returns:
+        (B, 1, H, W) float32 tensor on CUDA, phase normalised to [0, 1]
+    """
+    # Squeeze channel dim: (B, 1, H, W) → (B, H, W)
+    x = batch.squeeze(1)
+    # Batch 2D-FFT on GPU — fully vectorised
+    fft2 = torch.fft.fft2(x)                            # (B, H, W) complex
+    fft2_shifted = torch.fft.fftshift(fft2, dim=(-2, -1))  # shift DC to centre
+    phase = torch.angle(fft2_shifted)                    # ∈ [-π, π]
+    # Normalise to [0, 1]
+    phase = (phase + torch.pi) / (2 * torch.pi)
+    return phase.unsqueeze(1)                            # (B, 1, H, W)
+
+
+print("extract_phase_spectrum_gpu() defined ✅")
 
 # ── quick sanity check ──────────────────────────────────────────────────────
-_ds_test = PhaseSpectrumDataset(all_samples[:1])
-_phase, _lbl = _ds_test[0]
-print(f"Phase shape : {_phase.shape}")      # should be (1, 224, 224)
-print(f"Phase range : [{_phase.min():.3f}, {_phase.max():.3f}]")
-print(f"Label       : {_lbl.item()}")
-print("PhaseSpectrumDataset OK ✅")
+print("\nRunning sanity check on first sample (eval mode) ...")
+_ds_test = PhaseSpectrumDataset(all_samples[:1], is_train=False)
+_spatial, _lbl = _ds_test[0]
+print(f"  Spatial tensor shape : {_spatial.shape}")    # (1, 224, 224)
+print(f"  Spatial tensor range : [{_spatial.min():.3f}, {_spatial.max():.3f}]")
+print(f"  Label                : {int(_lbl.item())} ({'Fake' if _lbl.item() == 1 else 'Real'})")
+
+# Test GPU extractor if CUDA is available
+if torch.cuda.is_available():
+    _batch = _spatial.unsqueeze(0).to(DEVICE)
+    _phase = extract_phase_spectrum_gpu(_batch)
+    print(f"  GPU phase shape      : {_phase.shape}")    # (1, 1, 224, 224)
+    print(f"  GPU phase range      : [{_phase.min():.3f}, {_phase.max():.3f}]")
+    print("  ℹ️  Phase values in [0, 1] — normalised from [-π, π]")
+    del _batch, _phase
+    torch.cuda.empty_cache()
+else:
+    print("  ⚠️  CUDA not available — GPU extractor will be tested at training time")
+print("PhaseSpectrumDataset + GPU Extractor OK ✅")
 
 
 # %% ═══════════════════════════════════════════════════════════════════════════
@@ -271,11 +321,15 @@ train_idx = indices[:n_train]
 val_idx   = indices[n_train : n_train + n_val]
 test_idx  = indices[n_train + n_val:]
 
-full_dataset = PhaseSpectrumDataset(all_samples, crop_size=CROP_SIZE)
+# Create TWO dataset instances: training (dynamic augmentation) vs eval (static crop)
+print("\n🔧 Creating dataset instances ...")
+train_full_dataset = PhaseSpectrumDataset(all_samples, crop_size=CROP_SIZE, is_train=True)
+eval_full_dataset  = PhaseSpectrumDataset(all_samples, crop_size=CROP_SIZE, is_train=False)
 
-train_ds = Subset(full_dataset, train_idx)
-val_ds   = Subset(full_dataset, val_idx)
-test_ds  = Subset(full_dataset, test_idx)
+# Map the splits to the correct instances
+train_ds = Subset(train_full_dataset, train_idx)
+val_ds   = Subset(eval_full_dataset, val_idx)
+test_ds  = Subset(eval_full_dataset, test_idx)
 
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -499,9 +553,13 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip=1.0):
     n_correct = 0
     n_total   = 0
 
-    for phase_batch, labels in tqdm(loader, desc="  train", leave=False):
-        phase_batch = phase_batch.to(device, non_blocking=True)
-        labels      = labels.to(device, non_blocking=True).unsqueeze(1)
+    for spatial_batch, labels in tqdm(loader, desc="  train", leave=False):
+        # Move raw spatial tensors to GPU
+        spatial_batch = spatial_batch.to(device, non_blocking=True)
+        labels        = labels.to(device, non_blocking=True).unsqueeze(1)
+
+        # ── GPU FFT: convert spatial → phase spectrum on CUDA ────────
+        phase_batch = extract_phase_spectrum_gpu(spatial_batch)
 
         optimizer.zero_grad()
         logits = model(phase_batch)
@@ -510,7 +568,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip=1.0):
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        running_loss += loss.item() * phase_batch.size(0)
+        running_loss += loss.item() * spatial_batch.size(0)
         preds = (torch.sigmoid(logits) >= 0.5).float()
         n_correct += (preds == labels).sum().item()
         n_total   += labels.size(0)
@@ -527,14 +585,18 @@ def evaluate(model, loader, criterion, device):
     all_probs  = []
     all_labels = []
 
-    for phase_batch, labels in tqdm(loader, desc="  eval ", leave=False):
-        phase_batch = phase_batch.to(device, non_blocking=True)
-        labels      = labels.to(device, non_blocking=True).unsqueeze(1)
+    for spatial_batch, labels in tqdm(loader, desc="  eval ", leave=False):
+        # Move raw spatial tensors to GPU
+        spatial_batch = spatial_batch.to(device, non_blocking=True)
+        labels        = labels.to(device, non_blocking=True).unsqueeze(1)
+
+        # ── GPU FFT: convert spatial → phase spectrum on CUDA ────────
+        phase_batch = extract_phase_spectrum_gpu(spatial_batch)
 
         logits = model(phase_batch)
         loss   = criterion(logits, labels)
 
-        running_loss += loss.item() * phase_batch.size(0)
+        running_loss += loss.item() * spatial_batch.size(0)
         probs = torch.sigmoid(logits).cpu()
         all_probs.append(probs)
         all_labels.append(labels.cpu())
@@ -639,9 +701,15 @@ print(classification_report(
 # CELL 8 — Visualisation: ROC Curve, Confusion Matrix, Learning Curves
 # ═══════════════════════════════════════════════════════════════════════════════
 
+print("\n📊 Generating visualisations ...")
+print("   → (a) ROC Curve")
+print("   → (b) Confusion Matrix")
+print("   → (c) Learning Curves\n")
+
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
 # ── (a) ROC Curve ────────────────────────────────────────────────────────────
+print("  [1/3] Plotting ROC Curve ...")
 fpr, tpr, _ = roc_curve(test_labels, test_probs)
 axes[0].plot(fpr, tpr, color="royalblue", lw=2,
              label=f"KAN (AUC = {roc_auc:.4f})")
@@ -651,14 +719,18 @@ axes[0].set_ylabel("True Positive Rate", fontsize=12)
 axes[0].set_title("ROC Curve", fontsize=14, fontweight="bold")
 axes[0].legend(fontsize=11)
 axes[0].grid(alpha=0.3)
+print("        ROC Curve done ✅")
 
 # ── (b) Confusion Matrix ────────────────────────────────────────────────────
+print("  [2/3] Plotting Confusion Matrix ...")
 cm = confusion_matrix(test_labels, test_preds)
 disp = ConfusionMatrixDisplay(cm, display_labels=["Real", "Fake"])
 disp.plot(ax=axes[1], cmap="Blues", colorbar=False)
 axes[1].set_title("Confusion Matrix", fontsize=14, fontweight="bold")
+print("        Confusion Matrix done ✅")
 
 # ── (c) Learning Curves ─────────────────────────────────────────────────────
+print("  [3/3] Plotting Learning Curves ...")
 epochs_range = list(range(1, len(history["train_loss"]) + 1))
 axes[2].plot(epochs_range, history["train_loss"], label="Train Loss", lw=2)
 axes[2].plot(epochs_range, history["val_loss"], label="Val Loss", lw=2)
@@ -673,11 +745,18 @@ lines1, labels1 = axes[2].get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 axes[2].legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc="center right")
 axes[2].grid(alpha=0.3)
+print("        Learning Curves done ✅")
 
+# ── Save to disk ─────────────────────────────────────────────────────────────
 plt.tight_layout()
-plt.savefig("kan_deepfake_results.png", dpi=150, bbox_inches="tight")
+results_path = "kan_deepfake_results.png"
+plt.savefig(results_path, dpi=150, bbox_inches="tight")
+print(f"\n💾 Results figure saved → {results_path}")
+
+# ── Display inline (Colab / Jupyter) ─────────────────────────────────────────
+print("🖼️  Displaying results inline ...")
 plt.show()
-print("Results figure saved → kan_deepfake_results.png ✅")
+print("Visualisations complete ✅")
 
 
 # %% ═══════════════════════════════════════════════════════════════════════════
