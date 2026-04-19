@@ -146,12 +146,11 @@ def discover_images(root: Path) -> List[Tuple[str, int]]:
 all_samples = discover_images(DATASET_ROOT)
 random.shuffle(all_samples)
 
-# ── balance & cap (OOM prevention) ──────────────────────────────────────────
-MAX_SAMPLES_PER_CLASS = 25_000              # ≤50 k total — memory safe
-
+# ── balance classes ──────────────────────────────────────────────────────────
+# Use ALL images — lazy loading keeps memory safe (no OOM risk)
 reals = [(p, l) for p, l in all_samples if l == 0]
 fakes = [(p, l) for p, l in all_samples if l == 1]
-n_per_class = min(len(reals), len(fakes), MAX_SAMPLES_PER_CLASS)
+n_per_class = min(len(reals), len(fakes))   # balance to smaller class
 reals = reals[:n_per_class]
 fakes = fakes[:n_per_class]
 all_samples = reals + fakes
