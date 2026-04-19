@@ -1,0 +1,198 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{hidelinks}
+
+\begin{document}
+
+	itle{Dual-Channel FFT + KAN Deepfake Detection:\\
+A Reproducible Experimental Report on DeepDetect-2025}
+
+\author{\IEEEauthorblockN{Satvik Pathak}
+\IEEEauthorblockA{Department/Institution Name \\
+City, Country \\
+email@domain.com}}
+
+\maketitle
+
+\begin{abstract}
+This paper reports the exact experimental pipeline implemented in \texttt{bestfileyet007.ipynb} for binary deepfake detection (Real=0, Fake=1). The method converts grayscale spatial images to a dual-channel frequency representation and classifies samples with a convolutional stem followed by Kolmogorov--Arnold Network (KAN) layers. On a balanced DeepDetect-2025 subset of 103{,}986 images (51{,}993 real, 51{,}993 fake), with a deterministic 70/15/15 split, the run reports test loss 0.3683, accuracy 0.8324, precision 0.8222, recall 0.8483, F1-score 0.8351, and ROC-AUC 0.9172. This manuscript includes only formulas, settings, and outcomes directly present in the notebook implementation and outputs.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Deepfake Detection, Frequency Domain, FFT, Phase Spectrum, Magnitude Spectrum, Kolmogorov--Arnold Networks.
+\end{IEEEkeywords}
+
+\section{Scope and Experimental Contract}
+This manuscript documents one executed pipeline and one reported run from \texttt{bestfileyet007.ipynb}. The report is constrained to verified items only:
+\begin{itemize}
+    \item Input/output task: binary classification (Real vs Fake).
+    \item Data source used in code: DeepDetect-2025 (downloaded via \texttt{kagglehub}).
+    \item Model used in code: dual-channel FFT preprocessing + \texttt{PhaseKAN}.
+    \item Metrics reported from notebook outputs: accuracy, precision, recall, F1, ROC-AUC, confusion matrix, and classification report.
+\end{itemize}
+No external baseline, zero-shot, or state-of-the-art claim is made here.
+
+\section{Dataset Construction and Split}
+The notebook discovers image files and infers labels from directory names:
+\begin{itemize}
+    \item label 0: paths containing \texttt{real}
+    \item label 1: paths containing \texttt{fake}/\texttt{ai}/\texttt{synthetic}, or generator keywords
+\end{itemize}
+A balanced subset is built by truncating both classes to equal size.
+
+Observed manifest (printed by the notebook run):
+\begin{itemize}
+    \item Total: 103{,}986
+    \item Real: 51{,}993
+    \item Fake: 51{,}993
+\end{itemize}
+
+Let $N=103{,}986$. With ratios $(0.70,0.15,0.15)$ and integer rounding in code:
+\begin{align}
+N_{\text{train}} &= \lfloor 0.70N \rfloor = 72{,}790, \\
+N_{\text{val}}   &= \lfloor 0.15N \rfloor = 15{,}597, \\
+N_{\text{test}}  &= N - N_{\text{train}} - N_{\text{val}} = 15{,}599.
+\end{align}
+
+\section{Preprocessing and Frequency-Domain Formulation}
+\subsection{Spatial preprocessing}
+For each sample, the code performs:
+\begin{enumerate}
+    \item PIL load
+    \item grayscale conversion (single channel)
+    \item crop to $224\times224$ (random crop + horizontal flip for train, center crop for val/test)
+    \item conversion to tensor in $[0,1]$
+\end{enumerate}
+No resize interpolation is used in the notebook pipeline.
+
+\subsection{GPU dual-channel FFT extraction}
+Given a batch $\mathbf{X}\in\mathbb{R}^{B\times1\times H\times W}$, the code computes
+\begin{equation}
+\mathbf{F}=\operatorname{fftshift}(\operatorname{fft2}(\mathbf{X}_{\text{squeeze}})).
+\end{equation}
+
+Two channels are then created:
+\begin{align}
+\mathbf{P} &= \angle(\mathbf{F}), \\
+\mathbf{P}_{\text{norm}} &= \frac{\mathbf{P}+\pi}{2\pi}, \\
+\mathbf{M} &= \log\left(|\mathbf{F}| + 10^{-8}\right), \\
+\mathbf{M}_{\text{norm}} &= \frac{\mathbf{M}-\min(\mathbf{M})}{\max(\mathbf{M})-\min(\mathbf{M})+10^{-8}},
+\end{align}
+where min/max are computed per sample over spatial dimensions.
+The final model input is
+\begin{equation}
+\mathbf{Z}=\operatorname{stack}[\mathbf{P}_{\text{norm}},\mathbf{M}_{\text{norm}}]\in\mathbb{R}^{B\times2\times224\times224}.
+\end{equation}
+
+\section{Model and Optimization Equations}
+\subsection{Implemented architecture}
+The notebook model is \texttt{PhaseKAN}:
+\begin{itemize}
+    \item Conv stem: $(2\!\to\!64,s=2)\to(64\!\to\!128,s=1)\to(128\!\to\!128,s=2)\to(128\!\to\!256,s=1)\to(256\!\to\!256,s=2)$ with BatchNorm and GELU.
+    \item Adaptive average pool to a 256-d vector.
+    \item KAN head with widths $256\to128\to64\to1$ (with LayerNorm and Dropout=0.3 between hidden layers).
+\end{itemize}
+Reported trainable parameters: 1{,}337{,}154.
+
+\subsection{KAN block used in code}
+For input vector $\mathbf{x}$, each implemented \texttt{KANLinear} block uses two additive paths:
+\begin{equation}
+\mathbf{y}=\mathbf{W}_s\,\phi(\mathbf{x})+\mathbf{b}_s + \mathbf{W}_b\,\operatorname{SiLU}(\mathbf{x})+\mathbf{b}_b.
+\end{equation}
+Here $\phi(\cdot)$ is a per-feature B-spline activation module with trainable coefficients.
+
+\subsection{Loss and decision rule}
+The notebook uses \texttt{BCEWithLogitsLoss}. For logit $z$ and label $y\in\{0,1\}$:
+\begin{equation}
+\mathcal{L}(z,y) = -\left[y\log\sigma(z) + (1-y)\log(1-\sigma(z))\right].
+\end{equation}
+Prediction rule used in code:
+\begin{equation}
+\hat{y}=\mathbb{1}[\sigma(z)\ge 0.5].
+\end{equation}
+
+\subsection{Training hyperparameters from code}
+\begin{itemize}
+    \item Epoch budget: 35
+    \item Optimizer: AdamW, learning rate $10^{-3}$, weight decay $10^{-3}$
+    \item Scheduler: CosineAnnealingLR ($T_{\max}=35$, $\eta_{\min}=10^{-6}$)
+    \item Gradient clipping norm: 1.0
+    \item Early stopping patience: 10
+    \item Batch size: 96
+    \item Mixed precision on CUDA: enabled
+\end{itemize}
+
+\section{Reported Results (Notebook Output)}
+\subsection{Primary test metrics}
+\begin{table}[!t]
+\caption{Test-set metrics printed by the notebook.}
+\label{tab:primary}
+\centering
+\begin{tabular}{lc}
+	oprule
+Metric & Value \\
+\midrule
+Loss & 0.3683 \\
+Accuracy & 0.8324 (83.24\%) \\
+Precision & 0.8222 \\
+Recall & 0.8483 \\
+F1-score & 0.8351 \\
+ROC-AUC & 0.9172 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Class-wise and confusion matrix values}
+The classification report printed by the notebook:
+\begin{itemize}
+    \item Real: precision 0.8433, recall 0.8165, F1 0.8297, support 7799
+    \item Fake: precision 0.8222, recall 0.8483, F1 0.8351, support 7800
+\end{itemize}
+
+Confusion matrix (rows=true [Real, Fake], columns=pred [Real, Fake]):
+\begin{equation}
+\mathbf{C}=\begin{bmatrix}
+6368 & 1431 \\
+1183 & 6617
+\end{bmatrix}.
+\end{equation}
+
+\subsection{Training trajectory values}
+The logged run shows 35 completed epochs and restoration of the best validation-loss checkpoint. The smallest printed validation loss is 0.3552 (epoch 32), with validation accuracy 0.8418 at that epoch.
+
+\section{Reproducibility Snapshot (Printed)}
+\begin{itemize}
+    \item Python: 3.12.12
+    \item PyTorch: 2.10.0+cu128
+    \item Device: CUDA
+    \item Seed: 42
+\end{itemize}
+
+Notebook-generated files reported in output:
+\begin{itemize}
+    \item \texttt{dual\_channel\_fft\_ieee.png}
+    \item \texttt{kan\_deepfake\_results.png}
+    \item \texttt{runs/kan\_deepfake/best\_phase\_kan.pt}
+    \item \texttt{runs/kan\_deepfake/training\_summary.json}
+\end{itemize}
+
+\section{Limitations (Observed Scope Only)}
+This report covers one dataset construction pipeline and one run output from the notebook. It does not include external baseline comparison tables, multi-seed statistics, or cross-dataset zero-shot evaluation in the presented factual results.
+
+\section{Conclusion}
+The implemented dual-channel FFT + KAN pipeline in \texttt{bestfileyet007.ipynb} produces the reported test metrics on the DeepDetect-2025 balanced subset, with ROC-AUC 0.9172 and accuracy 83.24\%. All equations and numbers in this manuscript are directly aligned with the notebook code and printed outputs.
+
+\begin{thebibliography}{00}
+\bibitem{kan2024} Z. Liu \emph{et al.}, ``KAN: Kolmogorov--Arnold Networks,'' 2024.
+\end{thebibliography}
+
+\end{document}
