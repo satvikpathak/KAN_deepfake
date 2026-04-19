@@ -314,7 +314,7 @@ TRAIN_RATIO = 0.70
 VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
 BATCH_SIZE  = 64
-NUM_WORKERS = 2       # Colab is ~2 CPU cores
+NUM_WORKERS = 0       # 0 for Colab (multiprocessing workers cause AssertionError)
 
 n_total = len(all_samples)
 n_train = int(n_total * TRAIN_RATIO)
