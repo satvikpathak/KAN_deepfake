@@ -248,33 +248,42 @@ class PhaseSpectrumDataset(Dataset):
         return tensor, torch.tensor(label, dtype=torch.float32)
 
 
-# ── GPU Phase-Spectrum Extractor (batch-vectorised) ─────────────────────────
+# ── GPU Dual-Channel FFT Extractor (batch-vectorised) ───────────────────────
 
 def extract_phase_spectrum_gpu(batch: torch.Tensor) -> torch.Tensor:
     """
-    Compute 2-D FFT → shift → phase spectrum FOR AN ENTIRE BATCH on the GPU.
+    Compute 2-D FFT → shift → extract DUAL-CHANNEL features on the GPU.
 
-    This replaces the old per-sample CPU _extract_phase() and is the key
-    performance fix: a single vectorised CUDA call instead of N sequential
-    CPU FFTs inside the DataLoader workers.
+    Channel 0: Phase Spectrum   — structural anomalies, normalised [0, 1]
+    Channel 1: Magnitude Spectrum — energy distribution, log-scaled & [0, 1]
+
+    Combining both channels gives the KAN access to the *full* information
+    in the frequency domain, rather than discarding magnitude.
 
     Args:
-        batch: (B, 1, H, W) float32 tensor on CUDA
+        batch: (B, 1, H, W) float32 spatial tensor on CUDA
     Returns:
-        (B, 1, H, W) float32 tensor on CUDA, phase normalised to [0, 1]
+        (B, 2, H, W) float32 tensor on CUDA — [phase, magnitude]
     """
-    # Squeeze channel dim: (B, 1, H, W) → (B, H, W)
-    x = batch.squeeze(1)
-    # Batch 2D-FFT on GPU — fully vectorised
-    fft2 = torch.fft.fft2(x)                            # (B, H, W) complex
-    fft2_shifted = torch.fft.fftshift(fft2, dim=(-2, -1))  # shift DC to centre
-    phase = torch.angle(fft2_shifted)                    # ∈ [-π, π]
-    # Normalise to [0, 1]
+    x = batch.squeeze(1)                                    # (B, H, W)
+    fft2 = torch.fft.fft2(x)                                # (B, H, W) complex
+    fft_shift = torch.fft.fftshift(fft2, dim=(-2, -1))      # DC to centre
+
+    # Channel 0: Phase spectrum, naturally ∈ [-π, π] → normalised [0, 1]
+    phase = torch.angle(fft_shift)
     phase = (phase + torch.pi) / (2 * torch.pi)
-    return phase.unsqueeze(1)                            # (B, 1, H, W)
+
+    # Channel 1: Log-magnitude, per-sample min-max scaled to [0, 1]
+    mag = torch.log(torch.abs(fft_shift) + 1e-8)
+    mag_min = mag.amin(dim=(-2, -1), keepdim=True)
+    mag_max = mag.amax(dim=(-2, -1), keepdim=True)
+    mag = (mag - mag_min) / (mag_max - mag_min + 1e-8)
+
+    # Stack: (B, 2, H, W)
+    return torch.stack([phase, mag], dim=1)
 
 
-print("extract_phase_spectrum_gpu() defined ✅")
+print("extract_phase_spectrum_gpu() defined ✅  [Dual-Channel: Phase + Magnitude]")
 
 # ── quick sanity check ──────────────────────────────────────────────────────
 print("\nRunning sanity check on first sample (eval mode) ...")
@@ -284,18 +293,18 @@ print(f"  Spatial tensor shape : {_spatial.shape}")    # (1, 224, 224)
 print(f"  Spatial tensor range : [{_spatial.min():.3f}, {_spatial.max():.3f}]")
 print(f"  Label                : {int(_lbl.item())} ({'Fake' if _lbl.item() == 1 else 'Real'})")
 
-# Test GPU extractor if CUDA is available
 if torch.cuda.is_available():
     _batch = _spatial.unsqueeze(0).to(DEVICE)
-    _phase = extract_phase_spectrum_gpu(_batch)
-    print(f"  GPU phase shape      : {_phase.shape}")    # (1, 1, 224, 224)
-    print(f"  GPU phase range      : [{_phase.min():.3f}, {_phase.max():.3f}]")
-    print("  ℹ️  Phase values in [0, 1] — normalised from [-π, π]")
-    del _batch, _phase
+    _dual = extract_phase_spectrum_gpu(_batch)
+    print(f"  Dual-channel shape   : {_dual.shape}")          # (1, 2, 224, 224)
+    print(f"  Phase  (ch 0) range  : [{_dual[:,0].min():.3f}, {_dual[:,0].max():.3f}]")
+    print(f"  Mag    (ch 1) range  : [{_dual[:,1].min():.3f}, {_dual[:,1].max():.3f}]")
+    print("  ℹ️  Both channels normalised to [0, 1]")
+    del _batch, _dual
     torch.cuda.empty_cache()
 else:
     print("  ⚠️  CUDA not available — GPU extractor will be tested at training time")
-print("PhaseSpectrumDataset + GPU Extractor OK ✅")
+print("PhaseSpectrumDataset + Dual-Channel GPU Extractor OK ✅")
 
 
 # %% ═══════════════════════════════════════════════════════════════════════════
@@ -348,6 +357,78 @@ print(f"Train : {len(train_ds)}")
 print(f"Val   : {len(val_ds)}")
 print(f"Test  : {len(test_ds)}")
 print("DataLoaders ready ✅")
+
+
+# %% ═══════════════════════════════════════════════════════════════════════════
+# CELL 4.5 — IEEE Methodology Visualiser: Dual-Channel FFT Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("\n📐 Generating IEEE methodology figure ...")
+print("   → Visualising Spatial → Magnitude → Phase for Real & Fake samples\n")
+
+
+def plot_fft_transformations(dataset):
+    """
+    Visualise the dual-channel FFT extraction pipeline for IEEE methodology.
+    Pulls one Real and one Fake sample, shows:
+      (a) Spatial domain grayscale input
+      (b) Log-magnitude spectrum (energy distribution)
+      (c) Phase spectrum (structural anomalies)
+    """
+    real_idx, fake_idx = -1, -1
+    for i in range(len(dataset)):
+        _, label = dataset[i]
+        if label.item() == 0 and real_idx == -1:
+            real_idx = i
+        if label.item() == 1 and fake_idx == -1:
+            fake_idx = i
+        if real_idx != -1 and fake_idx != -1:
+            break
+
+    indices = [real_idx, fake_idx]
+    class_names = ["Real Image", "AI-Generated (Fake)"]
+
+    fig, axes = plt.subplots(len(indices), 3, figsize=(15, 5 * len(indices)))
+    fig.suptitle(
+        "Dual-Channel FFT Extraction for KAN Input",
+        fontsize=16, fontweight="bold", y=0.95,
+    )
+
+    for row, idx in enumerate(indices):
+        spatial_tensor, _ = dataset[idx]
+        spatial_img = spatial_tensor.squeeze(0).numpy()
+
+        fft2 = np.fft.fft2(spatial_img)
+        fft_shift = np.fft.fftshift(fft2)
+
+        magnitude = np.log(np.abs(fft_shift) + 1e-8)
+        phase = np.angle(fft_shift)
+
+        axes[row, 0].imshow(spatial_img, cmap="gray")
+        axes[row, 0].set_title(
+            f"{class_names[row]}\nSpatial Domain", fontsize=12
+        )
+        axes[row, 0].axis("off")
+
+        axes[row, 1].imshow(magnitude, cmap="viridis")
+        axes[row, 1].set_title(
+            "Channel 2: Magnitude Spectrum\n[Energy Distribution]", fontsize=12
+        )
+        axes[row, 1].axis("off")
+
+        axes[row, 2].imshow(phase, cmap="twilight")
+        axes[row, 2].set_title(
+            "Channel 1: Phase Spectrum\n[Structural Anomalies]", fontsize=12
+        )
+        axes[row, 2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig("dual_channel_fft_ieee.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    print("IEEE methodology figure saved → dual_channel_fft_ieee.png ✅")
+
+
+plot_fft_transformations(val_ds)
 
 
 # %% ═══════════════════════════════════════════════════════════════════════════
@@ -461,42 +542,53 @@ class KANLinear(nn.Module):
 
 class PhaseKAN(nn.Module):
     """
-    Full model: lightweight conv feature extractor → KAN classifier.
+    Dual-Channel PhaseKAN for IEEE Submission.
 
     Architecture:
-      1) Conv stem (3 blocks): reduces 224×224 → 28×28 → 128 channels
-      2) Global Average Pool → 128-dim vector
-      3) KAN layers: 128 → 64 → 32 → 1 (logit)
+      1) Deep Conv stem (5 blocks, stride-1/stride-2 mix):
+         2→64 (s2) → 64→128 (s1) → 128→128 (s2) → 128→256 (s1) → 256→256 (s2)
+         Preserves spatial detail in stride-1 blocks before reducing.
+      2) Global Average Pool → 256-dim vector
+      3) High-capacity KAN head: 256 → 128 → 64 → 1
+         with 16-knot B-splines for fine-grained activation learning.
     """
 
     def __init__(
         self,
-        in_channels: int = 1,
-        kan_hidden: List[int] = [64, 32],
-        num_knots: int = 8,
+        in_channels: int = 2,                   # Dual-channel: Phase + Magnitude
+        kan_hidden: List[int] = [256, 128, 64],  # Widened capacity
+        num_knots: int = 16,                     # Increased B-spline resolution
         dropout: float = 0.3,
     ):
         super().__init__()
 
-        # ── convolutional feature extractor ──────────────────────────────
+        # ── Deep convolutional feature extractor (5 blocks) ──────────────
         self.features = nn.Sequential(
-            # Block 1: 1 → 32, 224→112
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            # Block 2: 32 → 64, 112→56
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            # Block 1: 2 → 64, stride 2 — initial downsample (224→112)
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            # Block 3: 64 → 128, 56→28
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            # Block 2: 64 → 128, stride 1 — preserve spatial detail (112→112)
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.GELU(),
+            # Block 3: 128 → 128, stride 2 — downsample (112→56)
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            # Block 4: 128 → 256, stride 1 — preserve spatial detail (56→56)
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+            # Block 5: 256 → 256, stride 2 — final spatial reduction (56→28)
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)   # → (B, 128, 1, 1)
-        conv_out_dim = 128
+        self.pool = nn.AdaptiveAvgPool2d(1)   # → (B, 256, 1, 1)
+        conv_out_dim = 256
 
-        # ── KAN classifier head ──────────────────────────────────────────
+        # ── High-capacity KAN classifier head ────────────────────────────
         dims = [conv_out_dim] + kan_hidden + [1]
         layers = []
         for i in range(len(dims) - 1):
@@ -508,12 +600,12 @@ class PhaseKAN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, 1, 224, 224) — phase spectrum tensor
+        x: (B, 2, 224, 224) — dual-channel [phase, magnitude] tensor
         returns: (B, 1) — raw logit (apply sigmoid externally)
         """
-        h = self.features(x)       # (B, 128, 28, 28)
-        h = self.pool(h)           # (B, 128, 1, 1)
-        h = h.flatten(1)           # (B, 128)
+        h = self.features(x)       # (B, 256, 28, 28)
+        h = self.pool(h)           # (B, 256, 1, 1)
+        h = h.flatten(1)           # (B, 256)
         logit = self.kan_head(h)   # (B, 1)
         return logit
 
@@ -531,11 +623,11 @@ print("PhaseKAN model ready ✅")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── hyper-parameters ─────────────────────────────────────────────────────────
-NUM_EPOCHS    = 20
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY  = 1e-4
+NUM_EPOCHS    = 35
+LEARNING_RATE = 1e-3                # Increased for deeper architecture
+WEIGHT_DECAY  = 1e-3
 GRAD_CLIP     = 1.0
-PATIENCE      = 5               # early stopping patience (val loss)
+PATIENCE      = 10                  # Increased — give the model runway to learn
 
 criterion = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.AdamW(
